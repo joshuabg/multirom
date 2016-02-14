@@ -48,7 +48,20 @@
 #include "../lib/util.h"
 #include "../lib/log.h"
 
-//#define DEBUG_MISSING_UEVENTS 1
+//-------------------------------
+#define DEBUG_DEVICE_C_FULL 1
+
+
+#ifdef DEBUG_DEVICE_C_FULL
+
+#define DEBUG_INFO_MSGS 1
+#define DEBUG_MISSING_UEVENTS 1
+#define LOG_UEVENTS 1
+#define LOG_UEVENTS_LONG 1
+#define DEBUG_LINK_INFO 1
+
+#endif
+//-------------------------------
 
 #ifdef DEBUG_MISSING_UEVENTS
 #define UEVENT_ERR(x...) ERROR(x)
@@ -56,7 +69,7 @@
 #define UEVENT_ERR(x...)
 #endif
 
-#if 0
+#if DEBUG_INFO_MSGS
 #define DEBUG(x...) INFO(x)
 #else
 #define DEBUG(x...)
@@ -516,9 +529,16 @@ static void parse_event(const char *msg, struct uevent *uevent)
             ;
     }
 
+#ifndef LOG_UEVENTS_LONG
     log_event_print("event { '%s', '%s', '%s', '%s', %d, %d }\n",
                     uevent->action, uevent->path, uevent->subsystem,
                     uevent->firmware, uevent->major, uevent->minor);
+#else
+    log_event_print("event { '%s', '%s', '%s', '%s', '%s', '%s', %d, %d, %d }\n",
+                    uevent->action, uevent->path, uevent->subsystem,
+                    uevent->firmware, uevent->partition_name, uevent->device_name, 
+                    uevent->partition_num, uevent->major, uevent->minor);
+#endif
 }
 
 static char **get_character_device_symlinks(struct uevent *uevent)
@@ -576,6 +596,16 @@ err:
 
 static char **parse_platform_block_device(struct uevent *uevent)
 {
+    #define DEV_BLOCK_BOOTDEVICE "/dev/block/bootdevice" // add '/dev/block/bootdevice/...' support
+    #define LINKS_NUM_OF_SYMLINKS 8 // used to be hardcoded 4 below
+        // old: 0- /dev/block/platform/%s/by-name/<name>
+        // old: 1- /dev/block/platform/%s/by-num/p__
+        // old: 2- /dev/block/platform/%s/<mmcblk>
+        // add: 3- /dev/block/bootdevice/by-name/<name>
+        // add: 4- /dev/block/bootdevice/by-num/p__
+        // add: 5- /dev/block/bootdevice/<mmcblk>
+
+
     const char *device;
     struct platform_node *pdev;
     char *slash;
@@ -594,40 +624,89 @@ static char **parse_platform_block_device(struct uevent *uevent)
         return NULL;
     device = pdev->name;
 
-    char **links = malloc(sizeof(char *) * 4);
+    char **links = malloc(sizeof(char *) * LINKS_NUM_OF_SYMLINKS);
     if (!links)
         return NULL;
-    memset(links, 0, sizeof(char *) * 4);
+    memset(links, 0, sizeof(char *) * LINKS_NUM_OF_SYMLINKS);
 
     DEBUG("found platform device %s\n", device);
 
     snprintf(link_path, sizeof(link_path), "/dev/block/platform/%s", device);
 
+
+    // by-name support
     if (uevent->partition_name) {
         p = strdup(uevent->partition_name);
         sanitize(p);
         DEBUG("Linking partition '%s' as '%s', %s/by-name/%s\n", uevent->partition_name, p, link_path, p);
-        if (strcmp(uevent->partition_name, p))
+        if (!strcmp(uevent->partition_name, p)) // <--used to be missing ! or == 0
             INFO("Linking partition '%s' as '%s'\n", uevent->partition_name, p);
+
         if (asprintf(&links[link_num], "%s/by-name/%s", link_path, p) > 0)
+#ifndef DEBUG_LINK_INFO
             link_num++;
+#else
+            INFO("create link (%d): %s/by-name/%s\n", link_num++, link_path, p);
+#endif
         else
             links[link_num] = NULL;
+
+        if (asprintf(&links[link_num], "%s/by-name/%s", DEV_BLOCK_BOOTDEVICE, p) > 0)
+#ifndef DEBUG_LINK_INFO
+            link_num++;
+#else
+            INFO("create link (%d): %s/by-name/%s\n", link_num++, DEV_BLOCK_BOOTDEVICE, p);
+#endif
+        else
+            links[link_num] = NULL;
+
         free(p);
     }
 
+
+    // by-num support
     if (uevent->partition_num >= 0) {
         if (asprintf(&links[link_num], "%s/by-num/p%d", link_path, uevent->partition_num) > 0)
+#ifndef DEBUG_LINK_INFO
             link_num++;
+#else
+            INFO("create link (%d): %s/by-num/p%d\n", link_num++, link_path, uevent->partition_num);
+#endif
         else
             links[link_num] = NULL;
+
+        if (asprintf(&links[link_num], "%s/by-num/p%d", DEV_BLOCK_BOOTDEVICE, uevent->partition_num) > 0)
+#ifndef DEBUG_LINK_INFO
+            link_num++;
+#else
+            INFO("create link (%d): %s/by-num/p%d\n", link_num++, DEV_BLOCK_BOOTDEVICE, uevent->partition_num);
+#endif
+        else
+            links[link_num] = NULL;
+
     }
 
+
+    // normal mmcblk's
     slash = strrchr(uevent->path, '/');
     if (asprintf(&links[link_num], "%s/%s", link_path, slash + 1) > 0)
+#ifndef DEBUG_LINK_INFO
         link_num++;
+#else
+        INFO("create link (%d): %s/%s\n", link_num++, link_path, slash + 1);
+#endif
     else
         links[link_num] = NULL;
+
+    if (asprintf(&links[link_num], "%s/%s", DEV_BLOCK_BOOTDEVICE, slash + 1) > 0)
+#ifndef DEBUG_LINK_INFO
+        link_num++;
+#else
+        INFO("create link (%d): %s/%s\n", link_num++, DEV_BLOCK_BOOTDEVICE, slash + 1);
+#endif
+    else
+        links[link_num] = NULL;
+
 
     return links;
 }
@@ -641,7 +720,11 @@ static void handle_device(const char *action, const char *devpath,
         make_device(devpath, path, block, major, minor);
         if (links) {
             for (i = 0; links[i]; i++)
+#ifndef DEBUG_LINK_INFO
                 make_link(devpath, links[i]);
+#else
+                { INFO("make link: devpath='%s' link='%s'\n", devpath, links[i]); make_link(devpath, links[i]); }
+#endif
         }
     }
 
